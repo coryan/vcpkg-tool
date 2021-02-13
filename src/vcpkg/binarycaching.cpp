@@ -746,6 +746,209 @@ namespace
         bool m_interactive;
         bool m_use_nuget_cache;
     };
+
+    struct GsutilBinaryProvider : NullBinaryProvider
+    {
+        GsutilBinaryProvider(std::vector<fs::path> read_dirs,
+                             std::vector<fs::path> write_dirs,
+                             std::vector<std::string> gcs_prefixes,
+                             bool interactive)
+            : m_read_dirs(std::move(read_dirs))
+            , m_write_dirs(std::move(write_dirs))
+            , m_gcs_prefixes(std::move(gcs_prefixes))
+            , m_interactive(interactive)
+        {
+        }
+
+        void prefetch(const VcpkgPaths& paths, std::vector<const Dependencies::InstallPlanAction*>& actions) override
+        {
+            auto& fs = paths.get_filesystem();
+
+            const auto current_restored = m_restored.size();
+
+            for (const auto& prefix : m_gcs_prefixes)
+            {
+                std::vector<std::pair<std::string, fs::path>> url_paths;
+                std::vector<PackageSpec> specs;
+
+                for (auto&& action : actions)
+                {
+                    auto abi = action->package_abi();
+                    if (!abi) continue;
+
+                    specs.push_back(action->spec);
+                    auto pkgdir = paths.package_dir(action->spec);
+                    clean_prepare_dir(fs, pkgdir);
+                    pkgdir /= fs::u8path(Strings::concat(*abi.get(), ".zip"));
+                    url_paths.emplace_back(Strings::concat(prefix, '/', *abi.get(), ".zip"), pkgdir);
+                }
+
+                if (url_paths.empty()) break;
+
+                System::print2("Attempting to fetch ", url_paths.size(), " packages from GCS.\n");
+                const auto return_codes = gsutil_download_files(fs, url_paths);
+                for (std::size_t i = 0; i != return_codes.size(); ++i)
+                {
+                    if (return_codes[i] != 0) continue;
+                    if (decompress_archive(paths, paths.package_dir(specs[i]), url_paths[i].second).exit_code != 0)
+                    {
+                        Debug::print("Failed to decompress ", fs::u8string(url_paths[i].second), '\n');
+                        continue;
+                    }
+                    // decompression success
+                    fs.remove(url_paths[i].second, VCPKG_LINE_INFO);
+                    m_restored.insert(specs[i]);
+                }
+
+                Util::erase_remove_if(actions, [this](const Dependencies::InstallPlanAction* action) {
+                    return Util::Sets::contains(m_restored, action->spec);
+                });
+            }
+            System::print2("Restored ",
+                           m_restored.size() - current_restored,
+                           " packages from HTTP servers. Use --debug for more information.\n");
+        }
+        RestoreResult try_restore(const VcpkgPaths&, const Dependencies::InstallPlanAction& action) override
+        {
+            return Util::Sets::contains(m_restored, action.spec) ? RestoreResult::success : RestoreResult::missing;
+        }
+        void push_success(const VcpkgPaths& paths, const Dependencies::InstallPlanAction& action) override
+        {
+            if (m_gcs_prefixes.empty()) return;
+            const auto& abi_tag = action.abi_info.value_or_exit(VCPKG_LINE_INFO).package_abi;
+            auto& spec = action.spec;
+            auto& fs = paths.get_filesystem();
+            const auto tmp_archive_path = paths.buildtrees / spec.name() / (spec.triplet().to_string() + ".zip");
+            compress_directory(paths, paths.package_dir(spec), tmp_archive_path);
+
+            std::size_t upload_count = 0;
+            for (auto const& prefix : m_gcs_prefixes)
+            {
+                auto gcs_object = Strings::concat(prefix, '/', abi_tag, ".zip");
+                auto code = gcsutil_upload_file(fs, gcs_object, tmp_archive_path);
+                if (code >= 200 && code < 300)
+                {
+                    ++upload_count;
+                    continue;
+                }
+
+                System::print2(System::Color::warning, "Failed to upload to ", gcs_object, ": ", code, '\n');
+            }
+
+            System::print2("Uploaded binaries to ", upload_count, " GCS buckets.\n");
+
+            const auto archive_name = fs::u8path(abi_tag + ".zip");
+            for (const auto& archives_root_dir : m_write_dirs)
+            {
+                auto archive_path = archives_root_dir;
+                archive_path /= fs::u8path(abi_tag.substr(0, 2));
+                archive_path /= archive_name;
+                fs.create_directories(archive_path.parent_path(), ignore_errors);
+                std::error_code ec;
+                if (m_write_dirs.size() > 1)
+                {
+                    fs.copy_file(tmp_archive_path, archive_path, fs::copy_options::overwrite_existing, ec);
+                }
+                else
+                {
+                    fs.rename_or_copy(tmp_archive_path, archive_path, ".tmp", ec);
+                }
+
+                if (ec)
+                {
+                    System::printf(System::Color::warning,
+                                   "Failed to store binary cache %s: %s\n",
+                                   fs::u8string(archive_path),
+                                   ec.message());
+                }
+                else
+                {
+                    System::printf("Stored binary cache: %s\n", fs::u8string(archive_path));
+                }
+            }
+            // In the case of 1 write dir, the file will be moved instead of copied
+            if (m_write_dirs.size() != 1)
+            {
+                fs.remove(tmp_archive_path, ignore_errors);
+            }
+        }
+        void precheck(const VcpkgPaths&,
+                      std::unordered_map<const Dependencies::InstallPlanAction*, RestoreResult>& results_map) override
+        {
+            for (auto const& prefix : m_gcs_prefixes)
+            {
+                std::vector<std::string> objects;
+                std::vector<const Dependencies::InstallPlanAction*> url_actions;
+                for (auto&& kv : results_map)
+                {
+                    if (kv.second != RestoreResult::missing) continue;
+                    auto abi = kv.first->package_abi();
+                    if (!abi) continue;
+                    objects.push_back(Strings::concat(prefix, *abi.get(), ".zip"));
+                    url_actions.push_back(kv.first);
+                }
+
+                auto const stats = gsutil_stats(objects);
+                Checks::check_exit(VCPKG_LINE_INFO, stats.size() == url_actions.size());
+                for (std::size_t i = 0; i < stats.size(); ++i)
+                {
+                    if (!stats[i]) continue;
+                    results_map[url_actions[i]] = RestoreResult::success;
+                }
+            }
+        }
+
+    private:
+        int run_gsutil_commandline(const System::Command& cmdline) const
+        {
+            if (m_interactive)
+            {
+                return System::cmd_execute(cmdline);
+            }
+
+            auto res = System::cmd_execute_and_capture_output(cmdline);
+            if (Debug::g_debugging)
+            {
+                System::print2(res.output);
+            }
+
+            return res.exit_code;
+        }
+        int gcsutil_upload_file(Files::Filesystem&, std::string const& gcs_object, fs::path const& archive)
+        {
+            System::Command cmdline;
+            cmdline.string_arg("gsutil").string_arg("-q").string_arg("cp").path_arg(archive).string_arg(gcs_object);
+            return run_gsutil_commandline(cmdline);
+        }
+        std::vector<bool> gsutil_stats(std::vector<std::string> const& gcs_objects)
+        {
+            std::vector<bool> stats(gcs_objects.size());
+            std::transform(gcs_objects.begin(), gcs_objects.end(), stats.begin(), [this](std::string const& object) {
+                System::Command cmdline;
+                cmdline.string_arg("gsutil").string_arg("-q").string_arg("stat").string_arg(object);
+                return run_gsutil_commandline(cmdline) == 0;
+            });
+            return stats;
+        }
+        std::vector<int> gsutil_download_files(Files::Filesystem& ,
+                                               std::vector<std::pair<std::string, fs::path>> const& actions)
+        {
+            std::vector<int> results;
+            std::transform(actions.begin(), actions.end(), results.begin(), [this](auto const& p) {
+                System::Command cmdline;
+                cmdline.string_arg("gsutil").string_arg("-q").string_arg("stat").string_arg(p.first);
+                return run_gsutil_commandline(cmdline) == 0;
+            });
+            return results;
+        }
+
+        std::vector<fs::path> m_read_dirs;
+        std::vector<fs::path> m_write_dirs;
+        std::vector<std::string> m_gcs_prefixes;
+
+        std::set<PackageSpec> m_restored;
+        bool m_interactive;
+    };
 }
 
 namespace vcpkg
