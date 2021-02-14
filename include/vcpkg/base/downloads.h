@@ -17,6 +17,15 @@ namespace vcpkg::Downloads
 
         // e.g. {"https","//example.org", "/index.html"}
         Optional<SplitURIView> split_uri_view(StringView uri);
+
+        /// Download a file using gsutil -- only supports the gs:// scheme.
+        bool gsutil_download_file(const fs::path& download_path_part_path, const std::string& url, std::string& errors);
+
+        /// Upload a file using gsutil -- only supports the gs:// scheme.
+        int gsutil_put_file(StringView url, const fs::path& file);
+
+        /// Check if @p url exists.
+        bool gsutil_stat(StringView url);
     }
 
     void verify_downloaded_file_hash(const Files::Filesystem& fs,

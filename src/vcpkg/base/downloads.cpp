@@ -216,6 +216,37 @@ namespace vcpkg::Downloads
                            actual_hash);
     }
 
+    bool details::gsutil_download_file(const fs::path& download_path_part_path,
+                                       const std::string& url,
+                                       std::string& errors)
+    {
+        System::Command cmd;
+        cmd.string_arg("gsutil").string_arg("-q").string_arg("cp").string_arg(url).path_arg(download_path_part_path);
+        const auto out = System::cmd_execute_and_capture_output(cmd);
+        if (out.exit_code == 0) return true;
+        Strings::append(errors, url, ": ", out.output, '\n');
+        return false;
+    }
+
+    int details::gsutil_put_file(StringView url, const fs::path& file)
+    {
+        System::Command cmd;
+        cmd.string_arg("gsutil").string_arg("-q").string_arg("cp").path_arg(file).string_arg(url);
+        const auto out = System::cmd_execute_and_capture_output(cmd);
+        if (out.exit_code == 0) return 200;
+        System::print2(
+            System::Color::warning, "gsutil failed to execute with exit code: ", out.exit_code, '\n', out.output);
+        return 400; // simulate HTTP error codes.
+    }
+
+    bool details::gsutil_stat(StringView url)
+    {
+        System::Command cmd;
+        cmd.string_arg("gsutil").string_arg("-q").string_arg("stat").string_arg(url);
+        const auto res = System::cmd_execute(cmd);
+        return res == 0;
+    }
+
     static void url_heads_inner(View<std::string> urls, std::vector<int>* out)
     {
         static constexpr StringLiteral guid_marker = "8a1db05f-a65d-419b-aa72-037fb4d0672e";
